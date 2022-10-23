@@ -1,0 +1,177 @@
+from datetime import datetime
+import os
+import matplotlib
+import threading
+
+import backtrader as bt
+import backtrader.feeds as btfeeds
+
+from binancedata import *
+
+# Overall account balance
+account_balance = 100000
+
+# size of each trade in native currency
+# ie if backtesting on ETH, each trade will be 1ETH in size
+trade_size = 1
+
+# in %
+take_profit = 10
+stop_loss = 3
+# The difference between the current candle price compared to the previous one
+# If higher than 1% we will buy
+buy_trigger = 3
+
+# Get historical data and store filename
+# No need to run this if you already have historical data
+# Simply comment out and re-assign your filename to 'ETHUSDT_1 Jan 2021.csv' for example
+
+threads = []
+coins = get_coins()
+for coin in coins:
+
+    t = threading.Thread(target=get_historical_data, args=(coin, '1 Jan 2021', Client.KLINE_INTERVAL_1DAY) )
+    #'get_historical_data('ETHUSDT', '1 Jan 2021', Client.KLINE_INTERVAL_1MINUTE)
+    t.start()
+    threads.append(t)
+
+
+[thread.join() for thread in threads]
+
+def get_all_filenames():
+    for coin in coins:
+        return [get_historical_data(coin, '1 Jan 2021', Client.KLINE_INTERVAL_1DAY) for coin in coins]
+
+
+# Create a Stratey
+class TestStrategy(bt.Strategy):
+
+    def log(self, txt, dt=None):
+        ''' Logging function fot this strategy'''
+        dt = dt or self.datas[0].datetime.date(0)
+        #print('%s, %s' % (dt.isoformat(), txt))
+
+    def __init__(self):
+        # Keep a reference to the "close" line in the data[0] dataseries
+        self.dataclose = self.datas[0].close
+        # To keep track of pending orders
+        self.order = None
+        self.buyprice = None
+        self.buycomm = None
+        self.sma = bt.indicators.SimpleMovingAverage(self.datas[0], period=15)
+        self.rsi = bt.indicators.RelativeStrengthIndex()
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            # Buy/Sell order submitted/accepted to/by broker - Nothing to do
+            return
+
+        # Check if an order has been completed
+        # Attention: broker could reject order if not enough cash
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(
+                    'BUY EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f' %
+                    (order.executed.price,
+                     order.executed.value,
+                     order.executed.comm))
+                self.buyprice = order.executed.price
+                self.buycomm = order.executed.comm
+            elif order.issell():
+                self.log('SELL EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f' %
+                         (order.executed.price,
+                          order.executed.value,
+                          order.executed.comm))
+
+            self.bar_executed = len(self)
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log('Order Canceled/Margin/Rejected')
+
+        # Write down: no pending order
+        self.order = None
+
+    def notify_trade(self, trade):
+        if not trade.isclosed:
+            return
+
+        self.log('OPERATION PROFIT, GROSS %.2f, NET %.2f' %
+                 (trade.pnl, trade.pnlcomm))
+
+    def next(self):
+        # Simply log the closing price of the series from the reference
+        self.log('Close, %.2f' % self.dataclose[0])
+
+
+        # Check if an order is pending ... if yes, we cannot send a 2nd one
+        if self.order:
+            return
+
+        # Check if we are in the market
+        if not self.position:
+
+            # open a position if the current candle price is higher by at least 1%
+            # compared to the previous candle
+            if self.dataclose[0] > self.dataclose[-1] + (self.dataclose[-1]*buy_trigger/100):
+
+                    self.log('BUY CREATE, %.2f' % self.dataclose[0])
+                    # Keep track of the created order to avoid a 2nd order
+                    self.order = self.buy(size=trade_size, exectype=bt.Order.Market)
+                    # print(f'EXECUTED PRICE IS:{self.order.executed.price}')
+
+        if self.position:
+            if self.dataclose[0] > self.position.price + (self.position.price*take_profit/100) or  self.dataclose[0] < self.position.price - (self.position.price*stop_loss/100):
+
+                self.log('SELL CREATE, %.2f' % self.dataclose[0])
+                self.order = self.sell(size=trade_size, exectype=bt.Order.Market)
+                self.close()
+                self.order = self.close()
+
+def start_backtesting():
+
+    historical_data = get_all_filenames()
+    for coin in historical_data:
+        # Create a cerebro entity
+        cerebro = bt.Cerebro()
+
+        # Add a strategy
+        cerebro.addstrategy(TestStrategy)
+
+        # load data from our CSV file
+        data = btfeeds.GenericCSVData(
+
+        # Create a Data Feed
+        dataname=coin,
+        fromdate=datetime(2021, 1, 1),
+        todate=datetime(2021, 12, 2),
+        nullvalue=0.0,
+        dtformat=lambda x: datetime.utcfromtimestamp(float(x) / 1000.0),
+        datetime=0,
+        open=1,
+        high=2,
+        low=3,
+        close=4,
+        volume = -1,
+        openinterest=-1
+        )
+
+        # Add the Data Feed to Cerebro
+        cerebro.adddata(data)
+
+        # Set our desired cash start
+        cerebro.broker.setcash(account_balance)
+        #set trading commission fee
+        # cerebro.broker.setcommission(commission=0.001)
+        # Print out the starting conditions
+        print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue(),coin)
+
+        # Run over everything
+        cerebro.run()
+
+        cerebro.plot()
+        # Print out the final result
+        print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
+
+
+
+start_backtesting()
